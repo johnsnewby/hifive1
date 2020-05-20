@@ -1,22 +1,20 @@
 //! Stdout based on the UART hooked up to FTDI or J-Link
 
 use core::fmt;
-use nb::block;
-use riscv::interrupt;
 use e310x_hal::{
-    serial::{Serial, Tx, Rx},
-    gpio::gpio0::{Pin17, Pin16},
-    time::Bps,
     clock::Clocks,
     e310x::UART0,
-    prelude::*
+    gpio::gpio0::{Pin16, Pin17},
+    prelude::*,
+    serial::{Rx, Serial, Tx},
+    time::Bps,
 };
-
+use nb::block;
+use riscv::interrupt;
 
 static mut STDOUT: Option<SerialWrapper> = None;
 
-
-struct SerialWrapper(Tx<UART0>);
+struct SerialWrapper(Tx<UART0>, Rx<UART0>);
 
 impl core::fmt::Write for SerialWrapper {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -40,21 +38,65 @@ impl core::fmt::Write for SerialWrapper {
 }
 
 /// Configures stdout
-pub fn configure<X, Y>(
-    uart: UART0, tx: Pin17<X>, rx: Pin16<Y>,
-    baud_rate: Bps, clocks: Clocks
-) -> Rx<UART0> {
+pub fn configure<X, Y>(uart: UART0, tx: Pin17<X>, rx: Pin16<Y>, baud_rate: Bps, clocks: Clocks) {
     let tx = tx.into_iof0();
     let rx = rx.into_iof0();
     let serial = Serial::new(uart, (tx, rx), baud_rate, clocks);
     let (tx, rx) = serial.split();
 
-    interrupt::free(|_| {
-        unsafe {
-            STDOUT.replace(SerialWrapper(tx));
-        }
+    interrupt::free(|_| unsafe {
+        STDOUT.replace(SerialWrapper(tx, rx));
     });
-    return rx;
+}
+
+/// reads bytes into a buffer
+pub fn read(b: &mut [u8]) -> usize {
+    let stdout: &mut SerialWrapper = unsafe {
+        match STDOUT.as_mut() {
+            Some(x) => x,
+            None => return 0,
+        }
+    };
+    let len = b.len();
+    let mut idx = 0;
+    while idx < len {
+        let c = match block!(stdout.1.read()) {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        stdout.write_char(c as char);
+        b[idx] = c;
+        idx = idx + 1;
+        if c == '\n' as u8 || c == '\r' as u8 {
+            break;
+        }
+    }
+    idx
+}
+
+/// reads bytes into a buffer
+pub fn read_noblock(buf: &mut [u8], len: &mut usize) -> usize {
+    let stdout: &mut SerialWrapper = unsafe {
+        match STDOUT.as_mut() {
+            Some(x) => x,
+            None => return 0,
+        }
+    };
+    let mut read: usize = 0;
+    loop {
+        if *len == buf.len() {
+            break;
+        }
+        let c = match stdout.1.read() {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        read += 1;
+        stdout.write_char(c as char);
+        buf[*len] = c;
+        *len += 1;
+    }
+    read
 }
 
 /// Writes string to stdout
